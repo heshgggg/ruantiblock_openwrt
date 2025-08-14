@@ -1,43 +1,109 @@
-name: Sync with another repository
+name: Sync from upstream to my fork (push-to-repo)
 
 on:
   push:
     branches:
       - master
   schedule:
-      - cron: '0 * * * *'  # Запускать каждый час, для проверки обновлений
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout current repository
-        uses: actions/checkout@v2
+      - name: Checkout (full history, allow push with GITHUB_TOKEN)
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
-      - name: Set up Git
+      - name: Setup git user
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-      - name: Fetch changes from the external repository
+      - name: Add upstream remote and fetch
         run: |
-          git remote add external https://github.com/gSpotx2f/ruantiblock_openwrt
-          git fetch external
+          git remote add external https://github.com/gSpotx2f/ruantiblock_openwrt.git
+          git fetch external --tags --prune
 
-      - name: Check for updates and sync with the other Git host
+      - name: Detect default branch
+        id: detect
         run: |
-          commits=$(git log external/master..external/master --oneline | wc -l)
-          echo "Number of new commits: $commits"
-          if [ "$commits" -gt 0 ]; then
-            git remote add gitlab https://github.com/heshgggg/ruantiblock_openwrt
-            git push gitlab external/master:refs/heads/master
-            git fetch gitlab
-            update_number=$(git rev-list --count gitlab/main)
-            if [ "$update_number" -ge 5 ]; then
-              update_branch="update_$update_number"
-              git checkout -b $update_branch
-              git push gitlab $update_branch
-            fi
+          default_branch=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+          if [ -z "$default_branch" ]; then
+            default_branch="master"
           fi
+          echo "default_branch=$default_branch" >> $GITHUB_OUTPUT
+
+      - name: Debug info
+        run: |
+          echo "Default branch: ${{ steps.detect.outputs.default_branch }}"
+          git remote -v
+          git branch -a
+          echo "Last 5 external/${{ steps.detect.outputs.default_branch }}:"
+          git log --oneline -n 5 external/${{ steps.detect.outputs.default_branch }} || true
+          echo "Last 5 origin/${{ steps.detect.outputs.default_branch }}:"
+          git log --oneline -n 5 origin/${{ steps.detect.outputs.default_branch }} || true
+
+      - name: Count commits where external is ahead of origin
+        id: count
+        run: |
+          db=${{ steps.detect.outputs.default_branch }}
+          commits=$(git rev-list --count origin/${db}..external/${db} || echo 0)
+          echo "commits=$commits" >> $GITHUB_OUTPUT
+          echo "External is ahead by $commits commits"
+
+      - name: Prepare merge / create update branch
+        id: prepare
+        if: steps.count.outputs.commits != '0'
+        run: |
+          db=${{ steps.detect.outputs.default_branch }}
+          commits=${{ steps.count.outputs.commits }}
+          echo "Processing $commits new commits from external/$db"
+
+          # Переключаемся на origin/<branch>
+          git checkout -B ${db} origin/${db}
+
+          # Попытка fast-forward с внешней ветки
+          if git merge --ff-only external/${db}; then
+            echo "merge_result=ff" >> $GITHUB_OUTPUT
+          else
+            update_branch="update_${commits}_from_external"
+            git checkout -b ${update_branch} external/${db}
+            echo "merge_result=branch" >> $GITHUB_OUTPUT
+            echo "update_branch=${update_branch}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Push fast-forward result to my fork (using push-to-repo)
+        if: steps.prepare.outputs.merge_result == 'ff'
+        uses: tech-thinker/push-to-repo@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.GIT_PAT_TOKEN }}
+        with:
+          user-name: "github-actions[bot]"
+          user-email: github-actions[bot]@users.noreply.github.com
+          source-directory: "." 
+          destination-github-username: ${{ github.repository_owner }}
+          destination-repository-name: ${{ github.event.repository.name }}
+          target-branch: ${{ steps.detect.outputs.default_branch }}
+          commit-message: "chore(sync): fast-forward from upstream"
+
+      - name: Push update branch to my fork (using push-to-repo)
+        if: steps.prepare.outputs.merge_result == 'branch'
+        uses: tech-thinker/push-to-repo@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.GIT_PAT_TOKEN }}
+        with:
+          user-name: "github-actions[bot]"
+          user-email: github-actions[bot]@users.noreply.github.com
+          source-directory: "."
+          destination-github-username: ${{ github.repository_owner }}
+          destination-repository-name: ${{ github.event.repository.name }}
+          target-branch: ${{ steps.prepare.outputs.update_branch }}
+          commit-message: "chore(sync): create ${ { steps.prepare.outputs.update_branch } } from upstream"
+
+      - name: No updates
+        if: steps.count.outputs.commits == '0'
+        run: echo "No new commits on external/${{ steps.detect.outputs.default_branch }} to sync."
